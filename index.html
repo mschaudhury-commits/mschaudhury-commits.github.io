@@ -1,11 +1,422 @@
 <!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
+  <base target="_top">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>SpareCare Voice Capture</title>
-  <meta http-equiv="refresh" content="0; url=SpareCare_Voice_Capture_Popup.html">
+  <style>
+    *{box-sizing:border-box}
+    body{margin:0;font-family:Arial,sans-serif;background:#f5f7fb;color:#172033}
+    .shell{padding:12px;max-width:400px;margin:auto}
+    .card{background:#fff;border:1px solid #e1e7ec;border-radius:12px;padding:12px;box-shadow:0 4px 14px rgba(27,45,78,.10)}
+    h2{margin:0 0 4px;font-size:16px;color:#256D80}
+    .sub{font-size:11px;color:#6b7280;margin-bottom:10px;line-height:1.35}
+    label{display:block;font-size:11px;font-weight:700;margin-bottom:4px}
+    select{width:100%;height:32px;border:1px solid #cfd8de;border-radius:7px;padding:0 8px;font-size:12px;background:#fff}
+    button{width:100%;height:34px;margin-top:9px;border:0;border-radius:7px;background:#256D80;color:#fff;font-weight:700;font-size:13px;cursor:pointer}
+    button.listening{background:#b42318}
+    button:disabled{opacity:.65;cursor:default}
+    .status{margin-top:8px;padding:7px 8px;border-radius:7px;background:#eef7f8;color:#35515f;font-size:11px;min-height:32px;line-height:1.35;word-break:break-word;max-height:58px;overflow:auto}
+    .meta{margin-top:6px;font-size:10px;color:#6b7280;display:flex;justify-content:space-between;gap:8px}
+    .result{margin-top:7px;padding:7px 8px;border:1px solid #d7e0e5;border-radius:7px;background:#fff;font-size:11px;line-height:1.3;min-height:42px;max-height:58px;overflow:auto;word-break:break-word}
+    .actions{display:flex;gap:7px;margin-top:7px}
+    .actions button{margin-top:0;height:32px;font-size:12px}
+    .add{background:#18794e}.cancel{background:#667085}
+    .ok{color:#18794e}.err{color:#b42318}
+  </style>
 </head>
 <body>
-  Opening SpareCare Voice Capture...
+<div class="shell">
+  <div class="card">
+    <h2>🎙 SpareCare Voice Capture</h2>
+    <div class="sub">Speak continuously. Recognition is collected in multiple chunks and combined before translation.</div>
+
+    <label for="language">Voice Language</label>
+    <select id="language">
+      <option value="auto">Auto</option>
+      <option value="hi-IN">Hindi</option>
+      <option value="bn-IN">Bengali</option>
+      <option value="or-IN">Odia</option>
+      <option value="en-IN">English</option>
+      <option value="mr-IN">Marathi</option>
+      <option value="ta-IN">Tamil</option>
+      <option value="te-IN">Telugu</option>
+      <option value="kn-IN">Kannada</option>
+      <option value="gu-IN">Gujarati</option>
+    </select>
+
+    <button id="mic" type="button">🎙 Start Voice</button>
+    <div id="status" class="status">Ready. Click Start Voice and speak.</div>
+    <div class="meta"><span id="chunks">Chunks: 0</span><span id="chars">Characters: 0</span></div>
+    <div id="result" class="result">English translation will appear here after you stop speaking.</div>
+    <div class="actions">
+      <button id="addMom" class="add" type="button" disabled>✓ Add to MoM Line</button>
+      <button id="cancel" class="cancel" type="button">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  /* ==========================================================
+     SPARECARE VOICE CAPTURE — MULTI-CHUNK MODEL
+
+     IMPORTANT:
+     1. This page MUST be hosted on HTTPS (for example GitHub Pages).
+     2. It MUST be opened as a top-level browser window/tab.
+     3. Microphone/SpeechRecognition is used ONLY here.
+     4. Recognition results are accumulated across multiple recognition
+        chunks and are sent only after the user presses Stop Voice.
+     5. If Chrome ends one recognition chunk by itself, the page attempts
+        to start the next chunk automatically while the user is still in
+        recording mode.
+     6. Translation/grammar correction is performed by the Apps Script
+        parent page after the final RESULT message is received.
+  ========================================================== */
+
+  var recognition = null;
+  var running = false;
+  var userStopping = false;
+  var fatalError = false;
+  var restartTimer = null;
+  var finalTranscript = '';
+  var chunkCount = 0;
+  var selectedLanguage = 'auto';
+  var sessionId = 0;
+
+  var mic = document.getElementById('mic');
+  var status = document.getElementById('status');
+  var language = document.getElementById('language');
+  var chunksEl = document.getElementById('chunks');
+  var charsEl = document.getElementById('chars');
+  var resultEl = document.getElementById('result');
+  var addMom = document.getElementById('addMom');
+  var cancel = document.getElementById('cancel');
+  var translatedText = '';
+
+  function send(type, payload){
+    var msg = payload || {};
+    msg.source = 'SPARECARE_VOICE_CAPTURE';
+    msg.type = type;
+    try{
+      if(window.opener && !window.opener.closed){
+        window.opener.postMessage(msg, '*');
+      }
+    }catch(e){}
+  }
+
+  function setStatus(text, cls){
+    status.textContent = text || '';
+    status.className = 'status' + (cls ? ' ' + cls : '');
+  }
+
+  function updateMeta(){
+    chunksEl.textContent = 'Chunks: ' + chunkCount;
+    charsEl.textContent = 'Characters: ' + finalTranscript.length;
+  }
+
+  function setUiListening(on){
+    running = !!on;
+    mic.classList.toggle('listening', running);
+    mic.textContent = running ? '⏹ Stop Voice' : '🎙 Start Voice';
+  }
+
+  function getSpeechRecognition(){
+    return window.SpeechRecognition || window.webkitSpeechRecognition || null;
+  }
+
+  function clearRestartTimer(){
+    if(restartTimer){
+      clearTimeout(restartTimer);
+      restartTimer = null;
+    }
+  }
+
+  function isFatalRecognitionError(code){
+    return code === 'not-allowed' ||
+           code === 'service-not-allowed' ||
+           code === 'language-not-supported' ||
+           code === 'audio-capture';
+  }
+
+  function startChunk(mySession){
+    var SR = getSpeechRecognition();
+    if(!SR || !running || userStopping || fatalError || mySession !== sessionId) return;
+
+    clearRestartTimer();
+
+    try{
+      recognition = new SR();
+      recognition.lang = selectedLanguage === 'auto'
+        ? (navigator.language || 'en-IN')
+        : selectedLanguage;
+      recognition.interimResults = true;
+      recognition.continuous = true;
+      recognition.maxAlternatives = 1;
+
+      recognition.onstart = function(){
+        if(mySession !== sessionId) return;
+        setUiListening(true);
+        setStatus(
+          chunkCount > 0
+            ? 'Listening… continuing chunk ' + (chunkCount + 1) + '.'
+            : 'Listening… speak now.'
+        );
+        send('CHUNK_STARTED',{chunk:chunkCount + 1,sourceLanguage:selectedLanguage});
+      };
+
+      recognition.onresult = function(event){
+        if(mySession !== sessionId) return;
+
+        var interim = '';
+        var finalParts = [];
+
+        try{
+          /* resultIndex prevents previously-final results from being added again. */
+          for(var i=event.resultIndex || 0; i<event.results.length; i++){
+            var result = event.results[i];
+            var text = result && result[0]
+              ? String(result[0].transcript || '')
+              : '';
+
+            if(result.isFinal){
+              finalParts.push(text);
+            }else{
+              interim += text;
+            }
+          }
+        }catch(e){}
+
+        if(finalParts.length){
+          var addition = finalParts.join(' ').replace(/\s+/g,' ').trim();
+          if(addition){
+            finalTranscript += (finalTranscript ? ' ' : '') + addition;
+            chunkCount++;
+            updateMeta();
+          }
+        }
+
+        var preview = (finalTranscript + (interim ? ' ' + interim : '')).trim();
+        if(preview){
+          setStatus(preview);
+        }else{
+          setStatus('Listening… speak now.');
+        }
+      };
+
+      recognition.onerror = function(event){
+        if(mySession !== sessionId) return;
+
+        var code = String(event && event.error || 'unknown');
+        var messages = {
+          'not-allowed':'Microphone permission was denied. Allow Microphone for this HTTPS site, then reload the page.',
+          'service-not-allowed':'Chrome speech service is not allowed. Check Chrome microphone/privacy permissions and try again.',
+          'audio-capture':'Chrome could not access the microphone. Check that the microphone is connected and available.',
+          'no-speech':'No speech was detected in this chunk. Continuing…',
+          'network':'Chrome could not reach the speech recognition service. Continuing…',
+          'aborted':'Voice recording was stopped.'
+        };
+        var message = messages[code] || ('Voice recognition error: ' + code);
+
+        if(isFatalRecognitionError(code)){
+          fatalError = true;
+          running = false;
+          setUiListening(false);
+          setStatus(message,'err');
+          send('ERROR',{code:code,message:message});
+          return;
+        }
+
+        if(code !== 'aborted' && running && !userStopping){
+          setStatus(message);
+        }
+      };
+
+      recognition.onend = function(){
+        if(mySession !== sessionId) return;
+
+        recognition = null;
+
+        if(fatalError){
+          setUiListening(false);
+          return;
+        }
+
+        if(userStopping || !running){
+          setUiListening(false);
+          finishRecording(mySession);
+          return;
+        }
+
+        /* Chrome may end a recognition connection even in continuous mode.
+           Start a new recognition chunk without ending the user's recording. */
+        setUiListening(true);
+        setStatus('Recognition chunk ended. Continuing…');
+        restartTimer = setTimeout(function(){
+          restartTimer = null;
+          startChunk(mySession);
+        },250);
+      };
+
+      recognition.start();
+    }catch(err){
+      recognition = null;
+
+      if(mySession !== sessionId) return;
+
+      if(running && !userStopping && !fatalError){
+        setStatus('Restarting voice recognition…');
+        restartTimer = setTimeout(function(){
+          restartTimer = null;
+          startChunk(mySession);
+        },500);
+      }else{
+        setUiListening(false);
+        var msg = 'Could not start voice recognition: ' + (err && err.message ? err.message : err);
+        setStatus(msg,'err');
+        send('ERROR',{code:'start-failed',message:msg});
+      }
+    }
+  }
+
+  function finishRecording(mySession){
+    if(mySession !== sessionId) return;
+
+    clearRestartTimer();
+    var spoken = String(finalTranscript || '').replace(/\s+/g,' ').trim();
+
+    setUiListening(false);
+
+    if(spoken){
+      resultEl.textContent = 'Translating to English…';
+      translatedText = '';
+      addMom.disabled = true;
+      setStatus('Speech captured (' + chunkCount + ' chunks). Sending for English translation…','ok');
+      send('RESULT',{
+        sourceText:spoken,
+        sourceLanguage:selectedLanguage,
+        chunks:chunkCount,
+        characters:spoken.length
+      });
+    }else{
+      setStatus('No speech detected. Please try again.','err');
+      send('ERROR',{code:'no-speech',message:'No speech text was captured.'});
+    }
+  }
+
+  function stopRecording(){
+    if(!running){
+      if(finalTranscript){
+        finishRecording(sessionId);
+      }
+      return;
+    }
+
+    userStopping = true;
+    running = false;
+    clearRestartTimer();
+    setUiListening(false);
+    setStatus('Stopping… finalizing captured chunks.');
+
+    if(recognition){
+      try{recognition.stop();}catch(e){
+        recognition = null;
+        finishRecording(sessionId);
+      }
+    }else{
+      finishRecording(sessionId);
+    }
+
+    send('STOPPED',{chunks:chunkCount,characters:finalTranscript.length});
+  }
+
+
+  /* Receive the English translation from the PRO BDM parent page. */
+  window.addEventListener('message', function(event){
+    var d = event && event.data;
+    if(!d || d.source !== 'PRO_BDM_MOM') return;
+    if(d.type === 'TRANSLATION'){
+      translatedText = String(d.text || '').trim();
+      resultEl.textContent = translatedText || 'No English translation returned.';
+      addMom.disabled = !translatedText;
+      setStatus(translatedText ? 'Translation ready. Review it, then click Add to MoM Line.' : 'Translation failed.','ok');
+    }
+    if(d.type === 'CLOSE'){
+      try{window.close();}catch(e){}
+    }
+  }, false);
+
+  addMom.addEventListener('click', function(){
+    if(!translatedText) return;
+    send('OK',{text:translatedText});
+    setStatus('Added to MoM line.','ok');
+    addMom.disabled = true;
+    setTimeout(function(){try{window.close();}catch(e){}},150);
+  });
+
+  cancel.addEventListener('click', function(){
+    try{
+      if(recognition){ userStopping = true; running = false; clearRestartTimer(); recognition.stop(); }
+    }catch(e){}
+    send('CLOSED',{});
+    try{window.close();}catch(e){}
+  });
+
+  function start(){
+    var SR = getSpeechRecognition();
+    if(!SR){
+      setStatus('Speech Recognition is not supported. Please use the latest Google Chrome.','err');
+      send('ERROR',{code:'unsupported',message:'Speech Recognition is not supported in this browser. Please use Google Chrome.'});
+      return;
+    }
+
+    if(running){
+      stopRecording();
+      return;
+    }
+
+    clearRestartTimer();
+    sessionId++;
+    selectedLanguage = String(language.value || 'auto');
+    finalTranscript = '';
+    chunkCount = 0;
+    userStopping = false;
+    fatalError = false;
+    updateMeta();
+    setUiListening(true);
+    setStatus('Starting voice recognition…');
+
+    var mySession = sessionId;
+    send('STARTED',{sourceLanguage:selectedLanguage,multiChunk:true});
+    startChunk(mySession);
+  }
+
+  function loadLanguageFromUrl(){
+    try{
+      var params = new URLSearchParams(window.location.search);
+      var lang = params.get('lang');
+      if(lang){
+        var exists = Array.prototype.some.call(language.options,function(o){return o.value===lang;});
+        if(exists) language.value = lang;
+      }
+    }catch(e){}
+  }
+
+  /* Parent can ask the popup to stop. */
+  window.addEventListener('message',function(event){
+    var d = event && event.data;
+    if(!d || d.source !== 'PRO_BDM_MOM') return;
+    if(d.type === 'STOP') stopRecording();
+  },false);
+
+  mic.addEventListener('click',start);
+  loadLanguageFromUrl();
+  updateMeta();
+
+  send('READY',{sourceLanguage:language.value || 'auto',multiChunk:true});
+})();
+</script>
 </body>
 </html>
