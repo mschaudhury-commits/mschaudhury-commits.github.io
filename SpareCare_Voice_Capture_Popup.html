@@ -18,6 +18,10 @@
     button:disabled{opacity:.65;cursor:default}
     .status{margin-top:8px;padding:7px 8px;border-radius:7px;background:#eef7f8;color:#35515f;font-size:11px;min-height:32px;line-height:1.35;word-break:break-word;max-height:58px;overflow:auto}
     .meta{margin-top:6px;font-size:10px;color:#6b7280;display:flex;justify-content:space-between;gap:8px}
+    .result{margin-top:7px;padding:7px 8px;border:1px solid #d7e0e5;border-radius:7px;background:#fff;font-size:11px;line-height:1.3;min-height:42px;max-height:58px;overflow:auto;word-break:break-word}
+    .actions{display:flex;gap:7px;margin-top:7px}
+    .actions button{margin-top:0;height:32px;font-size:12px}
+    .add{background:#18794e}.cancel{background:#667085}
     .ok{color:#18794e}.err{color:#b42318}
   </style>
 </head>
@@ -44,6 +48,11 @@
     <button id="mic" type="button">🎙 Start Voice</button>
     <div id="status" class="status">Ready. Click Start Voice and speak.</div>
     <div class="meta"><span id="chunks">Chunks: 0</span><span id="chars">Characters: 0</span></div>
+    <div id="result" class="result">English translation will appear here after you stop speaking.</div>
+    <div class="actions">
+      <button id="addMom" class="add" type="button" disabled>✓ Add to MoM Line</button>
+      <button id="cancel" class="cancel" type="button">Cancel</button>
+    </div>
   </div>
 </div>
 
@@ -82,6 +91,10 @@
   var language = document.getElementById('language');
   var chunksEl = document.getElementById('chunks');
   var charsEl = document.getElementById('chars');
+  var resultEl = document.getElementById('result');
+  var addMom = document.getElementById('addMom');
+  var cancel = document.getElementById('cancel');
+  var translatedText = '';
 
   function send(type, payload){
     var msg = payload || {};
@@ -277,6 +290,9 @@
     setUiListening(false);
 
     if(spoken){
+      resultEl.textContent = 'Translating to English…';
+      translatedText = '';
+      addMom.disabled = true;
       setStatus('Speech captured (' + chunkCount + ' chunks). Sending for English translation…','ok');
       send('RESULT',{
         sourceText:spoken,
@@ -315,6 +331,38 @@
 
     send('STOPPED',{chunks:chunkCount,characters:finalTranscript.length});
   }
+
+
+  /* Receive the English translation from the PRO BDM parent page. */
+  window.addEventListener('message', function(event){
+    var d = event && event.data;
+    if(!d || d.source !== 'PRO_BDM_MOM') return;
+    if(d.type === 'TRANSLATION'){
+      translatedText = String(d.text || '').trim();
+      resultEl.textContent = translatedText || 'No English translation returned.';
+      addMom.disabled = !translatedText;
+      setStatus(translatedText ? 'Translation ready. Review it, then click Add to MoM Line.' : 'Translation failed.','ok');
+    }
+    if(d.type === 'CLOSE'){
+      try{window.close();}catch(e){}
+    }
+  }, false);
+
+  addMom.addEventListener('click', function(){
+    if(!translatedText) return;
+    send('OK',{text:translatedText});
+    setStatus('Added to MoM line.','ok');
+    addMom.disabled = true;
+    setTimeout(function(){try{window.close();}catch(e){}},150);
+  });
+
+  cancel.addEventListener('click', function(){
+    try{
+      if(recognition){ userStopping = true; running = false; clearRestartTimer(); recognition.stop(); }
+    }catch(e){}
+    send('CLOSED',{});
+    try{window.close();}catch(e){}
+  });
 
   function start(){
     var SR = getSpeechRecognition();
