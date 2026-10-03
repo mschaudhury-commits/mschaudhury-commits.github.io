@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>SpareCare Voice Capture</title>
+<style>
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0;width:100%;min-height:100%;font-family:Arial,sans-serif;background:#f5fbfc;color:#234452}
+  body{padding:14px}
+  .card{width:100%;max-width:390px;margin:0 auto;background:#fff;border:1px solid #c9e1e6;border-radius:12px;padding:14px;box-shadow:0 4px 16px rgba(0,0,0,.10)}
+  .title{font-size:15px;font-weight:800;margin-bottom:4px}
+  .sub{font-size:11px;color:#607d8b;margin-bottom:12px}
+  .row{display:flex;gap:8px;align-items:center}
+  select{flex:1;height:34px;border:1px solid #c8d8de;border-radius:8px;padding:0 8px;font-size:12px;color:#234452;background:#fff}
+  button{height:36px;border:1px solid #168a9a;border-radius:8px;background:#168a9a;color:#fff;font-size:12px;font-weight:800;padding:0 14px;cursor:pointer}
+  button:hover{background:#0f7887}
+  button.listening{background:#c62828;border-color:#c62828}
+  button:disabled{opacity:.65;cursor:not-allowed}
+  .status{margin-top:11px;min-height:32px;padding:8px;border-radius:8px;background:#f5f8f9;font-size:11px;line-height:1.35;color:#607d8b}
+  .status.ok{color:#2e7d32;background:#f1f8f2}
+  .status.err{color:#b71c1c;background:#fff4f4}
+  .hint{margin-top:9px;font-size:10px;color:#78909c;line-height:1.35}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="title">🎙 SpareCare Voice Capture</div>
+  <div class="sub">Speak in your selected language. The text will be translated to English after recording.</div>
+
+  <div class="row">
+    <select id="language" aria-label="Voice language">
+      <option value="auto">Auto</option>
+      <option value="hi-IN">Hindi</option>
+      <option value="bn-IN">Bengali</option>
+      <option value="or-IN">Odia</option>
+      <option value="en-IN">English</option>
+      <option value="mr-IN">Marathi</option>
+      <option value="ta-IN">Tamil</option>
+      <option value="te-IN">Telugu</option>
+      <option value="kn-IN">Kannada</option>
+      <option value="gu-IN">Gujarati</option>
+    </select>
+    <button id="mic" type="button">🔴 Start Recording</button>
+  </div>
+
+  <div id="status" class="status">Ready. Click Start Recording and speak.</div>
+  <div class="hint">Recording is processed only after you stop. Chrome microphone permission is required for this external HTTPS page.</div>
+</div>
+
+<script>
+(function(){
+  'use strict';
+
+  var recognition=null;
+  var running=false;
+  var finalText='';
+  var resultSent=false;
+  var stopRequested=false;
+
+  var mic=document.getElementById('mic');
+  var status=document.getElementById('status');
+  var language=document.getElementById('language');
+
+  function send(type,payload){
+    var msg=payload||{};
+    msg.source='SPARECARE_VOICE_CAPTURE';
+    msg.type=type;
+    try{
+      if(window.opener && !window.opener.closed){
+        window.opener.postMessage(msg,'*');
+      }
+    }catch(e){}
+  }
+
+  function setStatus(text,type){
+    status.textContent=text||'';
+    status.className='status'+(type?' '+type:'');
+  }
+
+  function resetButton(){
+    running=false;
+    mic.disabled=false;
+    mic.classList.remove('listening');
+    mic.textContent='🔴 Start Recording';
+  }
+
+  function cleanup(){
+    if(recognition){
+      recognition.onresult=null;
+      recognition.onerror=null;
+      recognition.onend=null;
+      try{recognition.stop();}catch(e){}
+      recognition=null;
+    }
+    resetButton();
+  }
+
+  function getLanguage(){
+    var v=String(language.value||'auto');
+    return v==='auto' ? (navigator.language||'en-IN') : v;
+  }
+
+  function finish(){
+    if(resultSent)return;
+    var spoken=String(finalText||'').replace(/\s+/g,' ').trim();
+
+    if(!spoken){
+      resetButton();
+      setStatus('No speech detected. Please try again.','err');
+      send('ERROR',{code:'no-speech',message:'No speech was detected.'});
+      return;
+    }
+
+    resultSent=true;
+    mic.disabled=true;
+    mic.classList.remove('listening');
+    mic.textContent='🔄 Sending…';
+    setStatus('Recording stopped. Sending speech text to PRO BDM…');
+
+    send('RESULT',{
+      sourceText:spoken,
+      sourceLanguage:String(language.value||'auto')
+    });
+
+    setStatus('Speech captured. Translating to English…','ok');
+
+    // Give the opener enough time to receive the message before closing.
+    setTimeout(function(){
+      try{window.close();}catch(e){}
+    },1200);
+  }
+
+  function start(){
+    var SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+    if(!SR){
+      setStatus('Speech Recognition is not supported by this browser. Please use Google Chrome.','err');
+      send('ERROR',{code:'unsupported',message:'Speech Recognition is not supported by this browser.'});
+      return;
+    }
+
+    if(running){
+      stop();
+      return;
+    }
+
+    finalText='';
+    resultSent=false;
+    stopRequested=false;
+
+    try{
+      recognition=new SR();
+      recognition.lang=getLanguage();
+      recognition.interimResults=true;
+      recognition.continuous=true;
+      recognition.maxAlternatives=1;
+
+      recognition.onstart=function(){
+        running=true;
+        mic.disabled=false;
+        mic.classList.add('listening');
+        mic.textContent='⏹ Stop Recording';
+        setStatus('Recording… speak now.');
+        send('STARTED');
+      };
+
+      recognition.onresult=function(ev){
+        var combined='';
+        try{
+          for(var i=0;i<ev.results.length;i++){
+            var r=ev.results[i];
+            if(r && r[0] && r.isFinal){
+              combined+=(r[0].transcript||'')+' ';
+            }
+          }
+          if(combined.trim()){
+            finalText=combined;
+          }
+        }catch(e){}
+      };
+
+      recognition.onerror=function(ev){
+        var code=ev&&ev.error?ev.error:'unknown';
+        if(code==='aborted')return;
+        running=false;
+        var msg='Voice input error: '+code;
+        if(code==='not-allowed'){
+          msg='Chrome denied microphone or Speech Recognition permission. Allow microphone access for this Voice Capture website and try again.';
+        }else if(code==='no-speech'){
+          msg='No speech was detected. Please speak clearly and try again.';
+        }else if(code==='network'){
+          msg='Speech Recognition could not connect to the recognition service. Check your internet connection.';
+        }else if(code==='language-not-supported'){
+          msg='The selected language is not supported by Chrome Speech Recognition.';
+        }
+        resetButton();
+        setStatus(msg,'err');
+        send('ERROR',{code:code,message:msg});
+      };
+
+      recognition.onend=function(){
+        if(!resultSent && (running || stopRequested)){
+          running=false;
+          stopRequested=false;
+          finish();
+        }
+      };
+
+      recognition.start();
+    }catch(err){
+      cleanup();
+      var msg=(err&&err.message)||'Unable to start recording.';
+      setStatus(msg,'err');
+      send('ERROR',{code:'start',message:msg});
+    }
+  }
+
+  function stop(){
+    if(!recognition){
+      resetButton();
+      return;
+    }
+    setStatus('Stopping recording…');
+    stopRequested=true;
+    try{recognition.stop();}catch(e){running=false;stopRequested=false;finish();}
+  }
+
+  mic.addEventListener('click',function(){
+    if(running) stop();
+    else start();
+  });
+
+  language.addEventListener('change',function(){
+    try{localStorage.setItem('sparecareVoiceLanguage',language.value);}catch(e){}
+  });
+
+  try{
+    var saved=localStorage.getItem('sparecareVoiceLanguage');
+    if(saved && Array.prototype.some.call(language.options,function(o){return o.value===saved;})){
+      language.value=saved;
+    }
+  }catch(e){}
+
+  send('READY');
+})();
+</script>
+</body>
+</html>
